@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+pydantic
+supabase
+mistralai
+python-dotenv
+groq
