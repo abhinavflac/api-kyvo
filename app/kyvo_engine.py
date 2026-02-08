@@ -583,7 +583,7 @@ class KyvoEngine:
     # DB search
     # --------------------------------------------------
     def run_direct_search(self, entities: Dict[str, Any]):
-        query = supabase.table("bearing_master").select("*")
+        query = get_supabase().table("bearing_master").select("*")
 
         if entities.get("bore_d_mm") is not None:
             query = query.eq("Bore_diameter", entities["bore_d_mm"])
