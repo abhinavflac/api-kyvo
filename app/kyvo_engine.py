@@ -1390,7 +1390,7 @@ class KyvoEngine:
 
         if designation:
             rows = (
-                supabase.table("bearing_master")
+                get_supabase().table("bearing_master")
                 .select("*")
                 .ilike("Designation", f"%{designation}%")
                 .execute()
