@@ -928,7 +928,7 @@ class KyvoEngine:
                 "engine_version": "Kyvo-Mechanical-v1.1",
                 "ready_for_inference": False,
                 "clarification_required": True,
-                "message": "It looks like some details are missing. To help you find the right bearing, could you specify the size, load, or the type of machine you are using?",
+                "message": "Let's find the right bearing. Please share a designation, dimensions, or your machine type to get started.",
                 "extracted_parameters": entities,
                 "results": [],
             }
@@ -1023,13 +1023,20 @@ class KyvoEngine:
             if not entities.get("life_hours"): missing.append("life_hours")
 
             if missing:
+                field_map = {
+                    "rpm": "Operation Speed (RPM)",
+                    "radial_load_kN": "Radial Load (kN)",
+                    "life_hours": "Expected Service Life (Hours)"
+                }
+                readable_missing = [field_map.get(m, m.replace('_', ' ')) for m in missing]
+
                 return {
                     "engine_version": "Kyvo-Mechanical-v1.1",
                     "ready_for_inference": False,
                     "missing_required_inputs": missing,
                     "extracted_parameters": entities,
                     "clarification_required": True,
-                    "message": f"We need a bit more info to calculate the best fit. Please provide the missing **{', '.join(missing).replace('_', ' ')}**, or just tell us the application (like 'gearbox' or 'conveyor') and we'll handle the rest!",
+                    "message": f"I'm missing the **{', '.join(readable_missing)}**. Could you provide these, or just tell me the machine type (e.g., 'Gearbox') and I'll handle the rest!",
                     "results": [],
                 }
         else:
