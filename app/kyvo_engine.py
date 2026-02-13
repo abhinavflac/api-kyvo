@@ -582,15 +582,60 @@ class KyvoEngine:
     # --------------------------------------------------
     # DB search
     # --------------------------------------------------
+    def apply_dimensional_filter(self, query, db_field: str, entities: Dict[str, Any], 
+                                  value_key: str, operator_key: str, max_key: str = None):
+        """
+        Apply dimensional filter with range operator support.
+        
+        Args:
+            query: Supabase query object
+            db_field: Database column name (e.g., "Bore_diameter", "D", "B")
+            entities: Extracted entities dict
+            value_key: Entity key for value (e.g., "bore_d_mm")
+            operator_key: Entity key for operator (e.g., "bore_operator")
+            max_key: Entity key for max value in range (e.g., "bore_max_mm")
+        
+        Returns:
+            Modified query object
+        """
+        value = entities.get(value_key)
+        if value is None:
+            return query
+            
+        operator = entities.get(operator_key, "eq")  # Default to exact match
+        
+        if operator == "lt":
+            return query.lt(db_field, value)
+        elif operator == "lte":
+            return query.lte(db_field, value)
+        elif operator == "gt":
+            return query.gt(db_field, value)
+        elif operator == "gte":
+            return query.gte(db_field, value)
+        elif operator == "between":
+            max_value = entities.get(max_key) if max_key else None
+            if max_value:
+                return query.gte(db_field, value).lte(db_field, max_value)
+            else:
+                # Fallback to exact match if max not provided
+                return query.eq(db_field, value)
+        else:  # "eq" or None or unknown
+            return query.eq(db_field, value)
+    
     def run_direct_search(self, entities: Dict[str, Any]):
         query = get_supabase().table("bearing_master").select("*")
 
-        if entities.get("bore_d_mm") is not None:
-            query = query.eq("Bore_diameter", entities["bore_d_mm"])
-        if entities.get("outer_D_mm") is not None:
-            query = query.eq("D", entities["outer_D_mm"])
-        if entities.get("width_B_mm") is not None:
-            query = query.eq("B", entities["width_B_mm"])
+        # Apply dimensional filters with range support
+        query = self.apply_dimensional_filter(
+            query, "Bore_diameter", entities, "bore_d_mm", "bore_operator", "bore_max_mm"
+        )
+        query = self.apply_dimensional_filter(
+            query, "D", entities, "outer_D_mm", "outer_D_operator", "outer_D_max_mm"
+        )
+        query = self.apply_dimensional_filter(
+            query, "B", entities, "width_B_mm", "width_B_operator", "width_B_max_mm"
+        )
+        
         if entities.get("bearing_type"):
             query = query.ilike("Category", f"%{entities['bearing_type']}%")
         if entities.get("brand"):
@@ -631,12 +676,26 @@ class KyvoEngine:
 
         min_speed = rpm * 0.7
 
-        data = get_supabase().table("bearing_master") \
-            .select("*") \
-            .gte("Basic_dynamic_load_rating", min_C) \
-            .lte("Basic_dynamic_load_rating", max_C) \
-            .or_(f"Limiting_speed_oil.gte.{min_speed},Limiting_speed_oil.is.null") \
-            .execute().data or []
+        # -------- BUILD QUERY WITH DIMENSIONAL FILTERS --------
+        query = get_supabase().table("bearing_master").select("*")
+        
+        # Primary filters: C and RPM
+        query = query.gte("Basic_dynamic_load_rating", min_C) \
+                     .lte("Basic_dynamic_load_rating", max_C) \
+                     .or_(f"Limiting_speed_oil.gte.{min_speed},Limiting_speed_oil.is.null")
+        
+        # Apply dimensional filters with range support
+        query = self.apply_dimensional_filter(
+            query, "Bore_diameter", entities, "bore_d_mm", "bore_operator", "bore_max_mm"
+        )
+        query = self.apply_dimensional_filter(
+            query, "D", entities, "outer_D_mm", "outer_D_operator", "outer_D_max_mm"
+        )
+        query = self.apply_dimensional_filter(
+            query, "B", entities, "width_B_mm", "width_B_operator", "width_B_max_mm"
+        )
+        
+        data = query.execute().data or []
 
         # -------- STATIC SAFETY POST FILTER --------
         filtered = []
