@@ -928,7 +928,7 @@ class KyvoEngine:
                 "engine_version": "Kyvo-Mechanical-v1.1",
                 "ready_for_inference": False,
                 "clarification_required": True,
-                "message": "I couldn't find any specific bearing requirements (like size, load, or application) in your query. Please provide more details.",
+                "message": "It looks like some details are missing. To help you find the right bearing, could you specify the size, load, or the type of machine you are using?",
                 "extracted_parameters": entities,
                 "results": [],
             }
@@ -1029,7 +1029,7 @@ class KyvoEngine:
                     "missing_required_inputs": missing,
                     "extracted_parameters": entities,
                     "clarification_required": True,
-                    "message": f"Operating conditions missing: {', '.join(missing)}. Please provide these values or specify the machine application (e.g., 'conveyor', 'gearbox').",
+                    "message": f"We need a bit more info to calculate the best fit. Please provide the missing **{', '.join(missing).replace('_', ' ')}**, or just tell us the application (like 'gearbox' or 'conveyor') and we'll handle the rest!",
                     "results": [],
                 }
         else:
