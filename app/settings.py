@@ -251,7 +251,8 @@ EXPECTED JSON FORMAT
   "bearing_type": null,
   "brand": null,
   "designation": null,
-  "application_hint": null
+  "application_hint": null,
+  "lubrication_method": null
 }
 
 ==========================
@@ -262,24 +263,36 @@ GENERAL EXTRACTION RULES
 - If a value is absent or ambiguous → always return null.
 - NEVER guess or infer anything not explicitly stated.
 - NEVER invent brands, types, loads, speeds, or dimensions.
+- IMPORTANT: If a designation (like '6205') is provided without explicit dimensions (like '25mm bore'), you MUST return dimensions as null. DO NOT calculate or guess dimensions from the bearing code.
 - NEVER output additional text.
 
 ==========================
 DIMENSION EXTRACTION RULES
 ==========================
 Extract dimensional numbers ONLY if the meaning is explicit.
+- "Bore", "ID", "Inner Diameter", "Shaft Diameter" → bore_d_mm
+- "OD", "Outer Diameter" → outer_D_mm
+- "Width", "B" → width_B_mm
 
 For EXACT matches (no operator):
 - "60 mm bore" → bore_d_mm = 60, bore_operator = null
 - "25mm bore" → bore_d_mm = 25, bore_operator = null
+- "50mm shaft" → bore_d_mm = 50, bore_operator = null
+- "shaft diameter 60" → bore_d_mm = 60, bore_operator = null
 - "bearing = 25mm" → bore_d_mm = 25, bore_operator = null
 - "bearing equal to 25mm" → bore_d_mm = 25, bore_operator = null
 - "bearings equal to 25 mm" → bore_d_mm = 25, bore_operator = null
 - "bearing with 25mm" → bore_d_mm = 25, bore_operator = null
 - "bore of 25mm" → bore_d_mm = 25, bore_operator = null
+- "bore diameter 30" → bore_d_mm = 30, bore_operator = null
+- "ID = 40mm" → bore_d_mm = 40, bore_operator = null
 - "outer diameter 120" → outer_D_mm = 120, outer_D_operator = null
 - "OD = 52mm" → outer_D_mm = 52, outer_D_operator = null
 - "width B 23 mm" → width_B_mm = 23, width_B_operator = null
+
+For equivalent/pivoted searches (Extract ONLY designation, keep dimensions NULL):
+- "Show me NNCF 5004 CV equivalent dimensions" → designation = "NNCF 5004 CV", bore_d_mm = null, outer_D_mm = null, width_B_mm = null
+- "bearings like 6205" → designation = "6205", bore_d_mm = null, outer_D_mm = null, width_B_mm = null
 
 All of above should have operator = null (or omitted entirely, which defaults to exact match).
 
@@ -290,18 +303,25 @@ For RANGE queries with operators:
 - "bore below 30" → bore_d_mm = 30, bore_operator = "lt"
 - "OD under 52mm" → outer_D_mm = 52, outer_D_operator = "lt"
 
-"less than or equal" / "at most" / "maximum" / "max":
+"greater than or equal" / "at least" / "minimum" / "min" / "≥" / ">=":
+- "bore at least 20mm" → bore_d_mm = 20, bore_operator = "gte"
+- "ID ≥ 40" → bore_d_mm = 40, bore_operator = "gte"
+- "ID >= 40" → bore_d_mm = 40, bore_operator = "gte"
+- "minimum bore 25mm" → bore_d_mm = 25, bore_operator = "gte"
+
+"less than or equal" / "at most" / "maximum" / "max" / "≤" / "<=":
 - "bore at most 25mm" → bore_d_mm = 25, bore_operator = "lte"
+- "OD ≤ 90" → outer_D_mm = 90, outer_D_operator = "lte"
+- "OD <= 90" → outer_D_mm = 90, outer_D_operator = "lte"
 - "maximum bore 30mm" → bore_d_mm = 30, bore_operator = "lte"
 
-"greater than" / "above" / "over" / "larger than":
+"greater than" / ">":
 - "bore greater than 30mm" → bore_d_mm = 30, bore_operator = "gt"
-- "bore above 25" → bore_d_mm = 25, bore_operator = "gt"
-- "width over 15mm" → width_B_mm = 15, width_B_operator = "gt"
+- "ID > 40" → bore_d_mm = 40, bore_operator = "gt"
 
-"greater than or equal" / "at least" / "minimum" / "min":
-- "bore at least 20mm" → bore_d_mm = 20, bore_operator = "gte"
-- "minimum bore 25mm" → bore_d_mm = 25, bore_operator = "gte"
+"less than" / "<":
+- "bore less than 25mm" → bore_d_mm = 25, bore_operator = "lt"
+- "OD < 60" → outer_D_mm = 60, outer_D_operator = "lt"
 
 "between" / "from X to Y" / "X to Y range":
 - "bore between 20mm and 30mm" → bore_d_mm = 20, bore_operator = "between", bore_max_mm = 30
@@ -409,6 +429,31 @@ ONE-SHOT EXAMPLE
 
 
 USER:
+"ID ≥ 40 mm and OD ≤ 90 mm, deep groove ball bearing"
+
+OUTPUT:
+{
+  "bore_d_mm": 40,
+  "bore_operator": "gte",
+  "bore_max_mm": null,
+  "outer_D_mm": 90,
+  "outer_D_operator": "lte",
+  "outer_D_max_mm": null,
+  "width_B_mm": null,
+  "width_B_operator": null,
+  "width_B_max_mm": null,
+  "life_hours": null,
+  "rpm": null,
+  "radial_load_kN": null,
+  "axial_load_kN": null,
+  "bearing_type": "deep groove ball",
+  "brand": null,
+  "designation": null,
+  "application_hint": null,
+  "lubrication_method": null
+}
+
+USER:
 "I need something like a 6312 bearing, SKF brand.
 Limiting speed greater than 12000 rpm.
 Bore 60mm, outer diameter 130, width 23.
@@ -417,8 +462,14 @@ Radial load 10kN, no axial load."
 OUTPUT:
 {
   "bore_d_mm": 60,
+  "bore_operator": null,
+  "bore_max_mm": null,
   "outer_D_mm": 130,
+  "outer_D_operator": null,
+  "outer_D_max_mm": null,
   "width_B_mm": 23,
+  "width_B_operator": null,
+  "width_B_max_mm": null,
   "life_hours": null,
   "rpm": 12000,
   "radial_load_kN": 10,
@@ -426,7 +477,8 @@ OUTPUT:
   "bearing_type": null,
   "brand": "SKF",
   "designation": "6312",
-  "application_hint": null
+  "application_hint": null,
+  "lubrication_method": null
 }
 
 
@@ -434,43 +486,29 @@ OUTPUT:
 APPLICATION HINT RULES
 ==========================
 
-- Before matching, normalize the user's text:
-  * Convert to lowercase.
-  * Replace "-" or "_" with a space.
-  * Remove extra spaces.
-- Tolerate minor spelling mistakes (e.g., "rockerarm" → "rocker arm").
-- Use fuzzy matching: if the word in the text closely resembles one of the valid hints, extract it.
-
-Valid application hints (and synonyms/fuzzy matches):
-- household machines → "household", "home appliances", "small motor", "blower", "light rolling mill", "automotive transmission"
-- agricultural machines → "agricultural", "farm equipment"
-- medical equipment → "medical", "hospital devices", "dental drill"
-- construction equipment → "construction", "excavator", "crane", "slewing", "turntable", "yaw drive", "rotary table"
-- industrial machinery → "industrial", "factory machines", "crusher", "cement mill", "rolling mill", "paper dryer", "large pump", "gearbox", "fan", "low speed motor", "rubber mixer"
-- conveyors → "conveyor", "belt conveyor"
-- pumps → "pump", "industrial pump", "high speed pump"
-- compressors → "compressor", "air compressor", "high performance motor"
-- elevators → "elevator", "lift"
-- cranes → "crane", "tower crane"
-- automotive systems → "automotive", "vehicle", "car", "automotive wheel", "propeller shaft", "engine", "rocker arm", "reducer", "machinery spindle"
-- high-speed spindles → "high speed spindle", "turbine", "rotor", "machine tool spindle", "turbocharger", "small turbine", "precision grinder", "textile spindle", "gas turbine", "aerospace", "gyroscope", "ultra high speed", "advanced turbine", "laboratory equipment"
-
-- Always output ONLY the JSON object.
-- If multiple hints match, pick the most specific one.
-- If no explicit hint is present, return null.
+- Extract the SPECIFIC MACHINE or APPLICATION mentioned by the user.
+- DO NOT map specific machines to generic categories (like 'industrial machinery'). 
+- Capture the primary machine noun as the `application_hint`.
 
 Examples:
-- "bearing for household machines" → application_hint = "household"
-- "used in agricultural equipment" → application_hint = "agricultural"
-- "for elevators or lifts" → application_hint = "elevator"
-- "crane application" → application_hint = "crane"
-- "used in a crusher" → application_hint = "industrial machinery"
-- "bearing for a high speed spindle" → application_hint = "high-speed spindles"
+- "bearing for electric motor" → application_hint = "electric motor"
+- "bearing for industrial fan" → application_hint = "industrial fan"
+- "conveyor belt bearing" → application_hint = "conveyor"
+- "used in a crusher" → application_hint = "crusher"
+- "gearbox bearing" → application_hint = "gearbox"
+- "household machine" → application_hint = "household"
+- "high speed spindle" → application_hint = "spindle"
 
-If application intent is not explicit → application_hint = null
-
+If no machine or application is explicitly mentioned → application_hint = null.
 Do NOT infer application from RPM or life.
 Only extract what the user explicitly says.
+
+==========================
+LUBRICATION METHOD RULES
+==========================
+- If user mentions "grease", "greased", "grease lubrication" → lubrication_method = "grease"
+- If user mentions "oil", "oil lubrication", "oil bath", "oil mist" → lubrication_method = "oil"
+- If unclear or not mentioned → null.
 
 
 
@@ -489,7 +527,8 @@ OUTPUT:
   "bearing_type": null,
   "brand": null,
   "designation": null,
-  "application_hint": "household"
+  "application_hint": "household",
+  "lubrication_method": null
 }
 
 
