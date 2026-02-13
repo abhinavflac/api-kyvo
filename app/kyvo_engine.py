@@ -706,7 +706,7 @@ class KyvoEngine:
             pass
 
         # -------- ADMISSION WINDOW --------
-        min_C = max(C_required * 0.20, 1.0)
+        min_C = max(C_required * 1.2, 5.0)
         max_C = C_required * 4.0
 
         min_speed = rpm
@@ -1083,7 +1083,7 @@ class KyvoEngine:
         # 8B. RELAX SEARCH IF EMPTY
         if not results:
 
-            relaxed_C = max(calc["C_required_kN"] * 0.4, 10.0)
+            relaxed_C = max(calc["C_required_kN"] * 0.8, 10.0)
             relaxed_used = True
 
             query = get_supabase().table("bearing_master") \
