@@ -239,6 +239,7 @@ class KyvoEngine:
             "brand": None,
             "designation": None,
             "application_hint": None,
+            "lubrication_method": None,
         }
 
         for k in template:
@@ -250,32 +251,32 @@ class KyvoEngine:
     # --------------------------------------------------
     # Intent
     # --------------------------------------------------
-    def decide_intent(self, entities: Dict[str, Any]) -> Dict[str, Any]:
+    def decide_intent(self, entities: Dict[str, Any]) -> str:
+        """
+        Determines the processing path:
+        - ENGINEERING_CALC: User wants a selection based on life/load or application.
+        - DIRECT_SEARCH: User is looking for dimensions or speed compatibility.
+        - EMPTY_QUERY: Not enough information to search.
+        """
         life = entities.get("life_hours")
         radial = entities.get("radial_load_kN")
-        rpm = entities.get("rpm")
         application_hint = entities.get("application_hint")
 
-        # Engineering intent triggers
-        if life is not None or radial is not None or rpm is not None:
-            return {
-                "intent": "ENGINEERING_SELECTION",
-                "missing_fields": [],
-                "reason": "Life, load, or speed specified → engineering calculation required."
-            }
+        # Explicit engineering requirements or application intent
+        if life is not None or radial is not None or application_hint is not None:
+            return "ENGINEERING_CALC"
 
-        if application_hint is not None:
-            return {
-                "intent": "ENGINEERING_SELECTION",
-                "missing_fields": [],
-                "reason": "Application-based request → derive engineering parameters."
-            }
+        # Check for searchable physical attributes or RPM-only broad search
+        # RAG Prompt #70: "What bearing is suitable at 1500 RPM" -> Filter by speed
+        searchable_keys = [
+            "bore_d_mm", "outer_D_mm", "width_B_mm", 
+            "bearing_type", "brand", "designation", "rpm"
+        ]
+        
+        if any(entities.get(k) is not None for k in searchable_keys):
+            return "DIRECT_SEARCH"
 
-        return {
-            "intent": "DIRECT_SEARCH",
-            "missing_fields": [],
-            "reason": "No engineering or application requirement → direct catalogue search."
-        }
+        return "EMPTY_QUERY"
 
     # --------------------------------------------------
     # Defaults from application
@@ -461,20 +462,24 @@ class KyvoEngine:
         # ---------------- HARD GUARDS ----------------
         if rpm is None or rpm <= 0:
             return {
-                "error": "RPM missing or invalid",
+                "error": "RPM missing or invalid. Please specify the rotational speed.",
                 "P_kN": None,
                 "C_required_kN": None
             }
 
         if life_hours is None or life_hours <= 0:
-            # Industrial fallback life (never zero)
-            life_hours = 12000.0
-            entities["life_hours"] = life_hours
+             return {
+                "error": "Life hours missing or invalid. Please provide the required life or application type (e.g., 'household machine', 'conveyor').",
+                "P_kN": None,
+                "C_required_kN": None
+            }
 
         if Fr is None or Fr <= 0:
-            # Life + RPM aware fallback load
-            Fr = self.generic_safe_load(rpm, life_hours)
-            entities["radial_load_kN"] = Fr
+             return {
+                "error": "Radial load missing or invalid. Please provide the load in kN or application type.",
+                "P_kN": None,
+                "C_required_kN": None
+            }
 
         # ---------------- ISO 281 LIFE CALC ----------------
         L10 = (life_hours * 60.0 * rpm) / 1_000_000.0
@@ -622,8 +627,25 @@ class KyvoEngine:
         else:  # "eq" or None or unknown
             return query.eq(db_field, value)
     
-    def run_direct_search(self, entities: Dict[str, Any]):
+    def run_direct_search(self, entities: Dict[str, Any], raw_query: str = ""):
         query = get_supabase().table("bearing_master").select("*")
+
+        # Check for 'equivalent' intent
+        is_equivalent_query = any(word in raw_query.lower() for word in ["equivalent", "alternate", "similar", "replacement", "like", "dimensions of"])
+        
+        # PIVOT LOGIC: If user asks for equivalents of a designation
+        if is_equivalent_query and entities.get("designation") and not (entities.get("bore_d_mm") or entities.get("outer_D_mm")):
+            # 1. Find the source bearing first
+            code = entities["designation"].replace(" ", "%") # Use % for flexible matching
+            source_bearing = get_supabase().table("bearing_master").select("*").ilike("Designation", f"%{code}%").limit(1).execute().data
+            
+            if source_bearing:
+                b = source_bearing[0]
+                entities["bore_d_mm"] = b.get("Bore_diameter")
+                entities["outer_D_mm"] = b.get("D")
+                entities["width_B_mm"] = b.get("B")
+                # Clear designation to find OTHER bearings with same size
+                entities["designation"] = None 
 
         # Apply dimensional filters with range support
         query = self.apply_dimensional_filter(
@@ -640,11 +662,24 @@ class KyvoEngine:
             query = query.ilike("Category", f"%{entities['bearing_type']}%")
         if entities.get("brand"):
             query = query.ilike("Brand", f"%{entities['brand']}%")
-        if entities.get("designation"):
-            code = entities["designation"].replace(" ", "")
+        
+        # CLEANUP: If designation is just a dimensional triple (e.g. 35x72x23), ignore it as a name filter
+        designation = entities.get("designation")
+        if designation:
+            import re
+            # Check for patterns like 35x72x23, 25*52*15, 60-110-22
+            is_triple = re.match(r"^\d+\s*[x\*\-]\s*\d+\s*[x\*\-]\s*\d+$", designation.lower())
+            if is_triple:
+                designation = None
+
+        if designation:
+            code = designation.replace(" ", "%")
             query = query.ilike("Designation", f"%{code}%")
         if entities.get("rpm"):
-            query = query.gte("Limiting_speed_oil", entities["rpm"])
+            # Select appropriate speed column based on method (default to oil for broad search)
+            method = entities.get("lubrication_method", "oil")
+            col = "Limiting_speed_grease" if method == "grease" else "Limiting_speed_oil"
+            query = query.gte(col, entities["rpm"])
 
         return query.execute().data
 
@@ -674,15 +709,19 @@ class KyvoEngine:
         min_C = max(C_required * 0.20, 1.0)
         max_C = C_required * 4.0
 
-        min_speed = rpm * 0.7
+        min_speed = rpm
 
         # -------- BUILD QUERY WITH DIMENSIONAL FILTERS --------
         query = get_supabase().table("bearing_master").select("*")
         
+        # Select appropriate speed column
+        method = entities.get("lubrication_method", "oil")
+        col = "Limiting_speed_grease" if method == "grease" else "Limiting_speed_oil"
+
         # Primary filters: C and RPM
         query = query.gte("Basic_dynamic_load_rating", min_C) \
                      .lte("Basic_dynamic_load_rating", max_C) \
-                     .or_(f"Limiting_speed_oil.gte.{min_speed},Limiting_speed_oil.is.null")
+                     .or_(f"{col}.gte.{min_speed},{col}.is.null")
         
         # Apply dimensional filters with range support
         query = self.apply_dimensional_filter(
@@ -725,9 +764,11 @@ class KyvoEngine:
 
         # -------- FAILSAFE --------
         if not filtered:
+            method = entities.get("lubrication_method", "oil")
+            col = "Limiting_speed_grease" if method == "grease" else "Limiting_speed_oil"
             fallback = get_supabase().table("bearing_master") \
                 .select("*") \
-                .or_(f"Limiting_speed_oil.gte.{min_speed},Limiting_speed_oil.is.null") \
+                .or_(f"{col}.gte.{min_speed},{col}.is.null") \
                 .execute().data or []
             return fallback[:50]
 
@@ -736,19 +777,19 @@ class KyvoEngine:
     # --------------------------------------------------
     # Public entry
     # --------------------------------------------------
-    def run(self, query: str) -> Dict[str, Any]:
+    def run(self, user_query: str) -> Dict[str, Any]:
 
         # --------------------------------------------------
         # LUBRICATION QUERY DETECTION (Stage-3 RAG)
         # --------------------------------------------------
-        q = query.lower()
+        q = user_query.lower()
 
-        lubrication_keywords = [
-            "iso vg", "viscosity", "lubrication", "lubricant",
-            "oil", "grease", "kappa", "film", "adequate lubrication"
+        lubrication_analysis_keywords = [
+            "iso vg", "vg", "viscosity", "kappa", "film thickness", 
+            "lubrication analysis", "lubrication check", "oil"
         ]
 
-        if any(k in q for k in lubrication_keywords):
+        if any(k in q for k in lubrication_analysis_keywords):
 
             import re
 
@@ -757,34 +798,61 @@ class KyvoEngine:
             rpm = None
             designation = None
 
-            # ISO VG
-            m = re.search(r"iso\s*vg\s*(\d+)", q)
+            # ISO VG - support "iso vg 100", "vg 100", "100vg", "100 vg"
+            m = re.search(r"\b(?:iso\s*vg|vg)\s*(\d+)\b|\b(\d+)\s*vg\b", q)
             if m:
-                iso_vg = int(m.group(1))
+                iso_vg = int(m.group(1) or m.group(2))
 
-            # Temperature (°C)
-            m = re.search(r"(\d+)\s*°?\s*c", q)
+            # Temperature (°C) - support 'C', '°C', and 'degrees'
+            m = re.search(r"\b(\d{1,3})\s*(?:°?\s*c|degrees)\b", q)
             if m:
                 temperature_c = float(m.group(1))
 
             # RPM
-            m = re.search(r"(\d+)\s*rpm", q)
+            m = re.search(r"\b(\d+)\s*rpm\b", q)
             if m:
                 rpm = float(m.group(1))
 
             # Comprehensive Bearing Identification
-            # 1. Numeric: 1xxx-8xxx (e.g., 6208, 22210, 51105)
-            # 2. Alphanumeric: NU, NJ, NUP, HK etc. (e.g., NU205, NJ 308)
-            # We use word boundaries \b to avoid picking up 80 from "80C"
+            # Pre-clean the string to avoid picking up operating parameters as designation
+            clean_q = re.sub(r"\b(?:iso\s*vg|vg)\s*\d+\b|\b\d+\s*vg\b", "", q)
+            clean_q = re.sub(r"\b\d+\s*rpm\b", "", clean_q)
+            clean_q = re.sub(r"\b\d{1,3}\s*(?:°?\s*c|degrees)\b", "", clean_q)
+            clean_q = re.sub(r"\b\d+\.?\d*\s*kn\b", "", clean_q)
+            # Remove dimension patterns so they don't get caught as designations
+            clean_q = re.sub(r"\b(?:bore|id|shaft|od|width|b)\s*(?:of|is|at)?\s*(\d+\.?\d*)(?:\s*mm)?\b", "", clean_q)
+            clean_q = re.sub(r"\b(\d+\.?\d*)(?:\s*mm)?\s*(?:bore|id|shaft|od|width|b)\b", "", clean_q)
+
+            # 1. Alphanumeric FIRST (e.g., NU205, NJ 308, NNCF 5004)
+            # 2. Numeric SECOND (e.g., 6208, 22210)
             patterns = [
-                r"\b([1-8]\d{1,4})\b",               # Classic numeric
-                r"\b([a-z]{1,3}\s?\d{2,5})\b",       # Alphanumeric like NU 205 or NU205
+                r"\b([a-z]{1,5}\s?\d{2,5}(?:\s?[a-z0-9/]+)?)\b", 
+                r"\b([1-8]\d{1,4}(?:\s?[a-z0-9/]+)?)\b",         
             ]
             
             for pat in patterns:
-                m = re.search(pat, q)
+                m = re.search(pat, clean_q)
                 if m:
-                    designation = m.group(1).replace(" ", "")
+                    candidate = m.group(1).strip()
+                    # Strip leading/trailing stop words (e.g., "for 1312 bearing" -> "1312")
+                    words = candidate.split()
+                    stop_words = ["iso", "at", "for", "is", "the", "and", "suitable", "in", "with", "a", "an", "bearing", "bearings", "like", "check", "analyze", "fine", "good", "ok", "oil", "well", "okay"]
+                    
+                    # Strip from start
+                    while words and words[0].lower() in stop_words:
+                        words.pop(0)
+                    # Strip from end
+                    while words and words[-1].lower() in stop_words:
+                        words.pop()
+                    
+                    if not words:
+                        continue
+                        
+                    # Filter out purely alphabetical words that are too short/common
+                    if len(words) == 1 and len(words[0]) <= 3 and words[0].isalpha():
+                        continue
+
+                    designation = " ".join(words)
                     break
 
             # Load extraction
@@ -792,14 +860,34 @@ class KyvoEngine:
             axial_load_kN = None
 
             # Radial Load (e.g., 5kN, 5 kN, 5.5kN)
-            m = re.search(r"(\d+\.?\d*)\s*kn", q)
+            m = re.search(r"(\d+\.?\d*)\s*kn\b", q)
             if m:
                 radial_load_kN = float(m.group(1))
 
             # Axial Load (specifically looking for axial/thrust)
-            m = re.search(r"axial\s*(\d+\.?\d*)\s*kn", q)
+            m = re.search(r"axial\s*(\d+\.?\d*)\s*kn\b", q)
             if m:
                 axial_load_kN = float(m.group(1))
+
+            # Dimension extraction in lubrication path (bore, OD, width)
+            bore_d_mm = None
+            outer_D_mm = None
+            width_B_mm = None
+
+            # Bore
+            m = re.search(r"\b(?:bore|id|inner\s*diameter|shaft)\s*(?:of|is|at)?\s*(\d+\.?\d*)(?:\s*mm)?\b|\b(\d+\.?\d*)(?:\s*mm)?\s*(?:bore|id|shaft)\b", q)
+            if m:
+                bore_d_mm = float(m.group(1) or m.group(2))
+
+            # OD
+            m = re.search(r"\b(?:od|outer\s*diameter)\s*(?:of|is|at)?\s*(\d+\.?\d*)(?:\s*mm)?\b|\b(\d+\.?\d*)(?:\s*mm)?\s*(?:od|outer\s*diameter)\b", q)
+            if m:
+                outer_D_mm = float(m.group(1) or m.group(2))
+
+            # Width
+            m = re.search(r"\b(?:width|width\s*b|b)\s*(?:of|is|at)?\s*(\d+\.?\d*)(?:\s*mm)?\b|\b(\d+\.?\d*)(?:\s*mm)?\s*(?:width|width\s*b|b)\b", q)
+            if m:
+                width_B_mm = float(m.group(1) or m.group(2))
 
             return self.evaluate_lubrication(
                 iso_vg=iso_vg,
@@ -807,13 +895,15 @@ class KyvoEngine:
                 rpm=rpm,
                 designation=designation,
                 radial_load_kN=radial_load_kN,
-                axial_load_kN=axial_load_kN
+                axial_load_kN=axial_load_kN,
+                bore_d_mm=bore_d_mm,
+                outer_D_mm=outer_D_mm
             )
 
         # -------------------------------
         # 1. Entity extraction
         # -------------------------------
-        entities = self.extract_entities(query)
+        entities = self.extract_entities(user_query)
         intent = self.decide_intent(entities)
 
         # -------------------------------
@@ -831,14 +921,25 @@ class KyvoEngine:
                     entities[k] = None
 
         # -------------------------------
-        # 2. Direct search
+        # 2. Intent Handling
         # -------------------------------
-        if intent["intent"] == "DIRECT_SEARCH":
+        if intent == "EMPTY_QUERY":
+            return {
+                "engine_version": "Kyvo-Mechanical-v1.1",
+                "ready_for_inference": False,
+                "clarification_required": True,
+                "message": "I couldn't find any specific bearing requirements (like size, load, or application) in your query. Please provide more details.",
+                "extracted_parameters": entities,
+                "results": [],
+            }
+
+        if intent == "DIRECT_SEARCH":
             return {
                 "engine_version": "Kyvo-Mechanical-v1.1",
                 "intent_type": "size-based",
+                "ready_for_inference": True,
                 "extracted_parameters": entities,
-                "results": self.run_direct_search(entities),
+                "results": self.run_direct_search(entities, user_query),
             }
 
         inference_info = None
@@ -906,46 +1007,43 @@ class KyvoEngine:
                         "duty_class": expert_defaults.get("duty_class"),
                     }
 
-        # -------------------------------
-        # 5. FINAL HARD SAFETY — NEVER ALLOW MISSING LOAD
-        # -------------------------------
-        if entities.get("radial_load_kN") is None:
+        # ---------------------------------
+        # 5. FINAL VALIDATION & PATH SELECTION
+        # ---------------------------------
+        
+        # Determine if we should enforce strict engineering validation.
+        # Strict validation is needed if the user specified engineering data (life/load)
+        # OR if they provided an application hint (implying a technical selection).
+        needs_engineering = (intent == "ENGINEERING_CALC" or entities.get("application_hint") is not None)
 
-            rpm_for_safe = entities.get("rpm") or 1000.0
-            life_for_safe = entities.get("life_hours") or 12000.0
+        if needs_engineering:
+            missing = []
+            if not entities.get("rpm"): missing.append("rpm")
+            if not entities.get("radial_load_kN"): missing.append("radial_load_kN")
+            if not entities.get("life_hours"): missing.append("life_hours")
 
-            safe_load = self.generic_safe_load(
-                rpm_for_safe,
-                life_for_safe
-            )
-
-            entities["radial_load_kN"] = safe_load
-
-            if entities.get("axial_load_kN") is None:
-                entities["axial_load_kN"] = round(safe_load * 0.1, 2)
-
-            if entities.get("rpm") is None:
-                entities["rpm"] = rpm_for_safe
-
-            if entities.get("life_hours") is None:
-                entities["life_hours"] = life_for_safe
-
-            if not inference_info:
-                inference_info = {
-                    "source": "generic_safe_load_fallback",
-                    "matched_application": "general_industrial",
-                    "duty_class": "unknown"
+            if missing:
+                return {
+                    "engine_version": "Kyvo-Mechanical-v1.1",
+                    "ready_for_inference": False,
+                    "missing_required_inputs": missing,
+                    "extracted_parameters": entities,
+                    "clarification_required": True,
+                    "message": f"Operating conditions missing: {', '.join(missing)}. Please provide these values or specify the machine application (e.g., 'conveyor', 'gearbox').",
+                    "results": [],
                 }
-
-        # 6. HARD VALIDATION (AFTER SAFETY FILL)
-        # Life is allowed to fallback inside engineering
-        if entities.get("rpm") is None:
+        else:
+            # DIRECT SEARCH PATH (Dimensions/RPM only)
+            # This follows RAG Prompt #70: "What bearing is suitable at 1500 RPM"
+            results = self.run_direct_search(entities, user_query)
             return {
                 "engine_version": "Kyvo-Mechanical-v1.1",
+                "intent_type": "direct-search",
+                "extracted_parameters": entities,
                 "ready_for_inference": False,
-                "missing_required_inputs": ["rpm"],
-                "results": [],
+                "results": results if results else [],
             }
+
 
         # 7. ENGINEERING CALCULATIONS
         calc = self.compute_engineering_requirements(entities)
@@ -960,7 +1058,7 @@ class KyvoEngine:
 
         # 7B. CONTAMINATION PRE-PROCESSOR
         # Infer environment from query if not explicitly provided
-        env_desc = entities.get("environment_description") or query
+        env_desc = entities.get("environment_description") or user_query
         inferred_env = self.infer_cleanliness(env_desc)
         
         # Inject into calc for downstream modules
@@ -1204,11 +1302,13 @@ class KyvoEngine:
 
         # ---------------- APPLICATION ALIAS MAP ----------------
         alias_map = {
-            # Slewing / crane
+            # Slewing / crane / heavy positioning
             "crane": "slewing_ring",
             "slewing bearing": "slewing_ring",
             "slew bearing": "slewing_ring",
             "turntable": "turntable_heavy",
+            "rotary table": "turntable_heavy",
+            "heavy turntable": "turntable_heavy",
 
             # Excavator
             "excavator": "excavator_swing",
@@ -1219,6 +1319,48 @@ class KyvoEngine:
             "yaw bearing": "wind_turbine_yaw",
             "yaw drive": "wind_turbine_yaw",
             "wind yaw": "wind_turbine_yaw",
+            "pitch bearing": "wind_turbine_yaw",
+
+            # Heavy Industrial
+            "conveyor belt": "conveyor",
+            "conveyors": "conveyor",
+            "stone crusher": "mining_crusher",
+            "crusher": "mining_crusher",
+            "cement mill": "cement_mill",
+            "ball mill": "cement_mill",
+            "paper dryer": "paper_dryer",
+            "paper machine": "paper_dryer",
+
+            # Pumps & Fans
+            "electric motor": "motor",
+            "industrial motor": "motor",
+            "small motor": "motor",
+            "induction motor": "motor",
+            "centrifugal pump": "centrifugal_pump",
+            "water pump": "centrifugal_pump",
+            "pump": "centrifugal_pump",
+            "industrial fan": "industrial_fan",
+            "blower": "blower",
+            "ventilation fan": "industrial_fan",
+            "cooling fan": "industrial_fan",
+
+            # Automotive / High Speed
+            "wheel hub": "wheel_hub",
+            "automotive wheel": "wheel_hub",
+            "car bearing": "wheel_hub",
+            "truck bearing": "wheel_hub",
+            "gearbox": "gearbox",
+            "industrial gearbox": "gearbox",
+            "transmission": "gearbox",
+            "spindle": "machine_tool_spindle",
+            "precision spindle": "machine_tool_spindle",
+            "machine tool": "machine_tool_spindle",
+            
+            # Household
+            "washing machine": "washing_machine",
+            "home appliance": "household",
+            "vacuum cleaner": "household",
+            "blender": "household",
         }
 
         # Normalize via alias first
@@ -1333,6 +1475,7 @@ class KyvoEngine:
         if iso_vg not in self.ISO_VG_TABLE:
             # Surgical fallback: Pick the closest available grade
             iso_vg = min(self.ISO_VG_TABLE.keys(), key=lambda x: abs(x - iso_vg))
+            points = self.ISO_VG_TABLE.get(iso_vg)
         if not points:
             return None
 
@@ -1439,7 +1582,9 @@ class KyvoEngine:
         rpm: Optional[float],
         designation: Optional[str],
         radial_load_kN: Optional[float] = None,
-        axial_load_kN: Optional[float] = None
+        axial_load_kN: Optional[float] = None,
+        bore_d_mm: Optional[float] = None,
+        outer_D_mm: Optional[float] = None
     ) -> Dict[str, Any]:
 
         # ---------------- Fetch bearing geometry ----------------
@@ -1448,18 +1593,41 @@ class KyvoEngine:
         bearing_results = []
 
         if designation:
-            rows = (
-                get_supabase().table("bearing_master")
-                .select("*")
-                .ilike("Designation", f"%{designation}%")
-                .execute()
-                .data
-            )
+            # Using flexible matching for names with spaces
+            code = designation.replace(" ", "%")
+            query_builder = get_supabase().table("bearing_master").select("*").ilike("Designation", f"%{code}%")
+            
+            # Apply dimension filters if provided alongside designation
+            if bore_d_mm:
+                query_builder = query_builder.eq("Bore_diameter", bore_d_mm)
+            if outer_D_mm:
+                query_builder = query_builder.eq("D", outer_D_mm)
+
+            rows = query_builder.execute().data
 
             if rows:
                 bearing_results = rows
                 d = rows[0].get("Bore_diameter")
                 D = rows[0].get("D")
+        elif bore_d_mm or outer_D_mm:
+            # Case where user asks for lubrication analysis using only dimensions
+            query_builder = get_supabase().table("bearing_master").select("*")
+            if bore_d_mm:
+                query_builder = query_builder.eq("Bore_diameter", bore_d_mm)
+            if outer_D_mm:
+                query_builder = query_builder.eq("D", outer_D_mm)
+            
+            rows = query_builder.limit(10).execute().data
+            if rows:
+                bearing_results = rows
+                d = rows[0].get("Bore_diameter")
+                D = rows[0].get("D")
+
+        # User-provided dimension overrides
+        if bore_d_mm:
+            d = bore_d_mm
+        if outer_D_mm:
+            D = outer_D_mm
 
         # ---------------- Compute lubrication ----------------
         d_m = self._mean_diameter(d, D) if d and D else None
